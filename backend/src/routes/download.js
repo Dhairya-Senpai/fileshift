@@ -11,7 +11,6 @@ const router = Router();
 /**
  * GET /api/download/:token
  * Verifies an HMAC-signed token, then streams the converted file.
- * Tokens come from GET /api/jobs/:id when a job is complete.
  */
 router.get('/:token', (req, res, next) => {
   try {
@@ -22,9 +21,8 @@ router.get('/:token', (req, res, next) => {
 
     const { outputFilename } = verified;
 
-    // Defense-in-depth: resolve the path and confirm it's inside outputsDir.
-    // The token signature already proves the filename hasn't been tampered
-    // with, but we still validate the resolved path in case of bugs.
+    // Defense in depth: even though the HMAC proves the filename wasn't
+    // tampered with, still confirm the resolved path is inside outputsDir.
     const filePath = path.resolve(config.storage.outputsDir, outputFilename);
     if (!filePath.startsWith(config.storage.outputsDir + path.sep)) {
       logger.warn('Path traversal attempt blocked', { outputFilename });
@@ -35,8 +33,6 @@ router.get('/:token', (req, res, next) => {
       return res.status(404).json({ error: 'File not found or already cleaned up.' });
     }
 
-    // Force download (not inline render) — never let the browser interpret
-    // a user-supplied file as something it might execute.
     const downloadName = encodeURIComponent(outputFilename);
     res.setHeader('Content-Disposition', `attachment; filename="${downloadName}"`);
     res.setHeader('Content-Type', 'application/octet-stream');
@@ -53,10 +49,19 @@ router.get('/:token', (req, res, next) => {
   }
 });
 
+/**
+ * Verify a token and return { jobId, outputFilename, expiry } or null.
+ * Each rejection path logs a distinct reason — invaluable for debugging.
+ *
+ * Payload is JSON (not dot-delimited) — see jobs.js signDownloadToken for why.
+ */
 function verifyDownloadToken(token) {
   try {
     const [encodedPayload, sig] = token.split('.');
-    if (!encodedPayload || !sig) return null;
+    if (!encodedPayload || !sig) {
+      logger.warn('Token rejected', { reason: 'bad shape — missing dot' });
+      return null;
+    }
 
     const payload = Buffer.from(encodedPayload, 'base64url').toString('utf8');
     const expectedSig = crypto
@@ -66,20 +71,48 @@ function verifyDownloadToken(token) {
 
     const sigBuf = Buffer.from(sig, 'hex');
     const expBuf = Buffer.from(expectedSig, 'hex');
-    if (sigBuf.length !== expBuf.length) return null;
-    // Constant-time compare — defeats timing oracles on signature checks.
-    if (!crypto.timingSafeEqual(sigBuf, expBuf)) return null;
 
-    const [jobId, outputFilename, expiryStr] = payload.split('.');
-    const expiry = parseInt(expiryStr, 10);
-    if (!expiry || expiry < Math.floor(Date.now() / 1000)) return null;
+    if (sigBuf.length !== expBuf.length) {
+      logger.warn('Token rejected', {
+        reason: 'sig length mismatch',
+        gotLen: sigBuf.length, expectedLen: expBuf.length,
+      });
+      return null;
+    }
+    if (!crypto.timingSafeEqual(sigBuf, expBuf)) {
+      logger.warn('Token rejected', {
+        reason: 'signature mismatch — token was signed with a different secret',
+        secretLen: config.download.tokenSecret.length,
+      });
+      return null;
+    }
 
-    // The filename embedded in the token must match what the worker produces:
-    // UUID.ext — no slashes, no dotdot, no funny business.
-    if (!/^[a-zA-Z0-9_-]+\.[a-zA-Z0-9]+$/.test(outputFilename)) return null;
+    let parsed;
+    try {
+      parsed = JSON.parse(payload);
+    } catch {
+      logger.warn('Token rejected', { reason: 'payload is not valid JSON', payload });
+      return null;
+    }
+
+    const { jobId, outputFilename, expiry } = parsed;
+    const now = Math.floor(Date.now() / 1000);
+    if (typeof expiry !== 'number' || expiry < now) {
+      logger.warn('Token rejected', {
+        reason: 'expired or missing expiry',
+        expiry, now, secondsLate: typeof expiry === 'number' ? now - expiry : null,
+      });
+      return null;
+    }
+    if (typeof outputFilename !== 'string' ||
+        !/^[a-zA-Z0-9_-]+\.[a-zA-Z0-9]+$/.test(outputFilename)) {
+      logger.warn('Token rejected', { reason: 'bad filename shape', outputFilename });
+      return null;
+    }
 
     return { jobId, outputFilename, expiry };
-  } catch {
+  } catch (err) {
+    logger.warn('Token rejected', { reason: 'exception', err: err.message });
     return null;
   }
 }

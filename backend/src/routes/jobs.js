@@ -12,7 +12,6 @@ const router = Router();
  */
 router.get('/:id', async (req, res, next) => {
   try {
-    // Job IDs from BullMQ are short strings — sanitize defensively anyway.
     const jobId = String(req.params.id).replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 64);
     if (!jobId) return res.status(400).json({ error: 'Invalid job id.' });
 
@@ -20,7 +19,6 @@ router.get('/:id', async (req, res, next) => {
     if (!job) return res.status(404).json({ error: 'Job not found.' });
 
     const state = await job.getState();
-    // state ∈ { 'completed', 'failed', 'active', 'waiting', 'delayed', 'paused', 'unknown' }
 
     const response = {
       jobId,
@@ -48,22 +46,24 @@ router.get('/:id', async (req, res, next) => {
 });
 
 /**
- * Build an HMAC-signed download token: base64url(payload) + "." + hex(sig)
- * Payload = jobId.outputFilename.expiry
+ * Build an HMAC-signed download token.
+ * Format: base64url(JSON payload) + "." + hex(HMAC-SHA256 sig)
  *
- * Why HMAC and not a session/DB lookup?
- *  - Stateless — works across multiple API instances behind a load balancer.
- *  - Short-lived — link expires automatically.
- *  - Tamper-proof — flipping bits in the filename breaks the signature.
+ * Using JSON in the payload (instead of dot-delimited fields) avoids the
+ * parsing ambiguity that occurs when fields themselves contain dots — e.g.
+ * the output filename "<uuid>.png" has its own dot, and a naive split('.')
+ * on a dot-delimited payload misaligned everything.
+ *
+ * Stateless / tamper-proof / time-limited — no DB lookup needed to validate.
  */
 function signDownloadToken(jobId, outputFilename) {
   const expiry = Math.floor(Date.now() / 1000) + config.download.tokenTtlSeconds;
-  const payload = `${jobId}.${outputFilename}.${expiry}`;
+  const payload = JSON.stringify({ jobId, outputFilename, expiry });
   const sig = crypto
     .createHmac('sha256', config.download.tokenSecret)
     .update(payload)
     .digest('hex');
-  const encoded = Buffer.from(payload).toString('base64url');
+  const encoded = Buffer.from(payload, 'utf8').toString('base64url');
   return `${encoded}.${sig}`;
 }
 

@@ -19,9 +19,12 @@ export const config = {
 
   // Files live OUTSIDE any web-served path. Downloads only happen via
   // signed-token endpoint, never by guessing a URL.
+  // workDir holds per-job scratch space — must be on the same filesystem
+  // as outputsDir so adapter renames are atomic (no EXDEV on Windows).
   storage: {
     uploadsDir: path.resolve(__dirname, '../../storage/uploads'),
     outputsDir: path.resolve(__dirname, '../../storage/outputs'),
+    workDir:    path.resolve(__dirname, '../../storage/work'),
     maxFileSize: intEnv('MAX_FILE_SIZE', 524_288_000), // 500 MB
     retentionHours: intEnv('RETENTION_HOURS', 2),
   },
@@ -36,6 +39,10 @@ export const config = {
     timeoutMs: intEnv('JOB_TIMEOUT_MS', 600_000),
     maxAttempts: intEnv('JOB_MAX_ATTEMPTS', 2),
     concurrency: intEnv('WORKER_CONCURRENCY', 2),
+  },
+
+  cleanup: {
+    intervalMinutes: intEnv('CLEANUP_INTERVAL_MINUTES', 15),
   },
 
   download: {

@@ -6,6 +6,7 @@ import { config } from './config/index.js';
 import { logger } from './utils/logger.js';
 import { errorHandler } from './middleware/errorHandler.js';
 import { generalLimiter } from './middleware/security.js';
+import { startCleanupCron } from './cron/cleanup.js';
 
 import uploadRouter from './routes/upload.js';
 import jobsRouter from './routes/jobs.js';
@@ -59,6 +60,8 @@ app.use(errorHandler);
 
 const server = app.listen(config.port, () => {
   logger.info(`FileShift API listening on port ${config.port} (${config.env})`);
+  // Cleanup runs in the API process — always-on, no extra process needed.
+  startCleanupCron();
 });
 
 // Graceful shutdown: stop accepting new connections, let in-flight requests
