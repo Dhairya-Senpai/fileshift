@@ -5,7 +5,14 @@ import { fileURLToPath } from 'url';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-dotenv.config({ path: path.resolve(__dirname, '../../.env') });
+// Single source of truth for env vars: <project-root>/.env
+// Same file is read by docker-compose, so dev and Docker stay in sync —
+// no risk of DOWNLOAD_TOKEN_SECRET drifting between deployment modes.
+// Falls back to backend/.env if the root file doesn't exist (legacy paths).
+const rootEnv = path.resolve(__dirname, '../../../.env');
+const localEnv = path.resolve(__dirname, '../../.env');
+dotenv.config({ path: rootEnv });
+dotenv.config({ path: localEnv });  // no-op if vars already set from rootEnv
 
 const intEnv = (name, fallback) => {
   const v = parseInt(process.env[name] ?? '', 10);
