@@ -31,8 +31,9 @@ router.get('/:id', async (req, res, next) => {
 
     if (state === 'completed' && job.returnvalue) {
       const { outputFilename, outputSize } = job.returnvalue;
+      const friendlyName = buildFriendlyName(job.data.displayName, job.data.targetExt);
       response.outputSize = outputSize;
-      response.downloadToken = signDownloadToken(jobId, outputFilename);
+      response.downloadToken = signDownloadToken(jobId, outputFilename, friendlyName);
     }
 
     if (state === 'failed') {
@@ -46,19 +47,39 @@ router.get('/:id', async (req, res, next) => {
 });
 
 /**
- * Build an HMAC-signed download token.
- * Format: base64url(JSON payload) + "." + hex(HMAC-SHA256 sig)
+ * Turn the original display name into a friendly download name with the
+ * target extension. Examples:
+ *   ("report.docx", "pdf")             -> "report.pdf"
+ *   ("vacation pic.JPG", "webp")       -> "vacation pic.webp"
+ *   ("no-extension", "png")            -> "no-extension.png"
+ *   ("", "png")                        -> "converted.png"
  *
- * Using JSON in the payload (instead of dot-delimited fields) avoids the
- * parsing ambiguity that occurs when fields themselves contain dots — e.g.
- * the output filename "<uuid>.png" has its own dot, and a naive split('.')
- * on a dot-delimited payload misaligned everything.
- *
- * Stateless / tamper-proof / time-limited — no DB lookup needed to validate.
+ * Sanitizes path-traversal characters even though displayName was already
+ * stripped of control chars at upload time — defense in depth.
  */
-function signDownloadToken(jobId, outputFilename) {
+function buildFriendlyName(displayName, targetExt) {
+  const ext = String(targetExt || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+  if (typeof displayName !== 'string' || !displayName) {
+    return `converted.${ext || 'bin'}`;
+  }
+  const lastDot = displayName.lastIndexOf('.');
+  const stem = lastDot > 0 ? displayName.slice(0, lastDot) : displayName;
+  // Remove path separators, header-breaking quotes, and stray control chars.
+  // eslint-disable-next-line no-control-regex
+  const safe = stem.replace(/[\\/:*?"<>|\x00-\x1f]/g, '_').trim();
+  const capped = safe.slice(0, 100) || 'converted';
+  return `${capped}.${ext || 'bin'}`;
+}
+
+/**
+ * HMAC-signed download token. Payload is JSON to avoid the parsing
+ * ambiguity dot-delimited fields caused (filenames contain dots too).
+ * friendlyName is part of the signed payload so the client can't tamper
+ * with it to influence the Content-Disposition the server sends back.
+ */
+function signDownloadToken(jobId, outputFilename, friendlyName) {
   const expiry = Math.floor(Date.now() / 1000) + config.download.tokenTtlSeconds;
-  const payload = JSON.stringify({ jobId, outputFilename, expiry });
+  const payload = JSON.stringify({ jobId, outputFilename, friendlyName, expiry });
   const sig = crypto
     .createHmac('sha256', config.download.tokenSecret)
     .update(payload)

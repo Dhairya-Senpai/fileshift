@@ -8,10 +8,6 @@ import { logger } from '../utils/logger.js';
 
 const router = Router();
 
-/**
- * GET /api/download/:token
- * Verifies an HMAC-signed token, then streams the converted file.
- */
 router.get('/:token', (req, res, next) => {
   try {
     const verified = verifyDownloadToken(String(req.params.token));
@@ -19,10 +15,8 @@ router.get('/:token', (req, res, next) => {
       return res.status(403).json({ error: 'Invalid or expired download token.' });
     }
 
-    const { outputFilename } = verified;
+    const { outputFilename, friendlyName } = verified;
 
-    // Defense in depth: even though the HMAC proves the filename wasn't
-    // tampered with, still confirm the resolved path is inside outputsDir.
     const filePath = path.resolve(config.storage.outputsDir, outputFilename);
     if (!filePath.startsWith(config.storage.outputsDir + path.sep)) {
       logger.warn('Path traversal attempt blocked', { outputFilename });
@@ -33,8 +27,9 @@ router.get('/:token', (req, res, next) => {
       return res.status(404).json({ error: 'File not found or already cleaned up.' });
     }
 
-    const downloadName = encodeURIComponent(outputFilename);
-    res.setHeader('Content-Disposition', `attachment; filename="${downloadName}"`);
+    // Use the friendly name from the token if present, fall back to the UUID
+    // filename for legacy tokens that don't have one.
+    res.setHeader('Content-Disposition', buildDisposition(friendlyName || outputFilename));
     res.setHeader('Content-Type', 'application/octet-stream');
     res.setHeader('X-Content-Type-Options', 'nosniff');
 
@@ -50,11 +45,27 @@ router.get('/:token', (req, res, next) => {
 });
 
 /**
- * Verify a token and return { jobId, outputFilename, expiry } or null.
- * Each rejection path logs a distinct reason — invaluable for debugging.
+ * Build a Content-Disposition header that handles unicode filenames properly.
  *
- * Payload is JSON (not dot-delimited) — see jobs.js signDownloadToken for why.
+ *   Content-Disposition: attachment; filename="<ascii fallback>"; filename*=UTF-8''<percent-encoded>
+ *
+ * Old browsers read `filename=` (ASCII-only). Modern browsers prefer
+ * `filename*=` per RFC 5987, which supports any UTF-8.
+ *
+ * encodeURIComponent doesn't escape some characters RFC 5987 requires
+ * escaped (single quote, parens, asterisk), so we touch those up manually.
  */
+function buildDisposition(filename) {
+  const asciiFallback = filename
+    .replace(/[^\x20-\x7e]/g, '_')  // strip non-ASCII
+    .replace(/["\\]/g, '_');         // strip quote/backslash that break the header
+
+  const encoded = encodeURIComponent(filename)
+    .replace(/['()*]/g, (c) => '%' + c.charCodeAt(0).toString(16).toUpperCase());
+
+  return `attachment; filename="${asciiFallback}"; filename*=UTF-8''${encoded}`;
+}
+
 function verifyDownloadToken(token) {
   try {
     const [encodedPayload, sig] = token.split('.');
@@ -71,46 +82,36 @@ function verifyDownloadToken(token) {
 
     const sigBuf = Buffer.from(sig, 'hex');
     const expBuf = Buffer.from(expectedSig, 'hex');
-
     if (sigBuf.length !== expBuf.length) {
-      logger.warn('Token rejected', {
-        reason: 'sig length mismatch',
-        gotLen: sigBuf.length, expectedLen: expBuf.length,
-      });
+      logger.warn('Token rejected', { reason: 'sig length mismatch' });
       return null;
     }
     if (!crypto.timingSafeEqual(sigBuf, expBuf)) {
-      logger.warn('Token rejected', {
-        reason: 'signature mismatch — token was signed with a different secret',
-        secretLen: config.download.tokenSecret.length,
-      });
+      logger.warn('Token rejected', { reason: 'signature mismatch' });
       return null;
     }
 
     let parsed;
-    try {
-      parsed = JSON.parse(payload);
-    } catch {
-      logger.warn('Token rejected', { reason: 'payload is not valid JSON', payload });
-      return null;
-    }
+    try { parsed = JSON.parse(payload); }
+    catch { logger.warn('Token rejected', { reason: 'payload not JSON' }); return null; }
 
-    const { jobId, outputFilename, expiry } = parsed;
+    const { jobId, outputFilename, friendlyName, expiry } = parsed;
     const now = Math.floor(Date.now() / 1000);
     if (typeof expiry !== 'number' || expiry < now) {
-      logger.warn('Token rejected', {
-        reason: 'expired or missing expiry',
-        expiry, now, secondsLate: typeof expiry === 'number' ? now - expiry : null,
-      });
+      logger.warn('Token rejected', { reason: 'expired', expiry, now });
       return null;
     }
     if (typeof outputFilename !== 'string' ||
         !/^[a-zA-Z0-9_-]+\.[a-zA-Z0-9]+$/.test(outputFilename)) {
-      logger.warn('Token rejected', { reason: 'bad filename shape', outputFilename });
+      logger.warn('Token rejected', { reason: 'bad outputFilename shape', outputFilename });
       return null;
     }
+    // friendlyName is optional (legacy tokens won't have it); when present,
+    // it must be a plain string. It's already part of the signed payload so
+    // we trust its content — but type-check anyway in case of malformed tokens.
+    const safeFriendlyName = (typeof friendlyName === 'string' && friendlyName) ? friendlyName : null;
 
-    return { jobId, outputFilename, expiry };
+    return { jobId, outputFilename, friendlyName: safeFriendlyName, expiry };
   } catch (err) {
     logger.warn('Token rejected', { reason: 'exception', err: err.message });
     return null;
