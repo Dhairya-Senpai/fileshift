@@ -1,0 +1,33 @@
+# Backend API image. No conversion tools needed here — the worker has those.
+# Kept small: alpine + production dependencies only.
+FROM node:20-alpine
+
+# Install tini FIRST (while still root). tini handles PID 1 signals correctly,
+# so `docker stop` triggers graceful shutdown instead of waiting 10s then SIGKILLing.
+RUN apk add --no-cache tini
+
+# Dedicated non-root user. Containers should never run as root by default —
+# limits blast radius of any code execution exploit.
+RUN addgroup -g 1001 fileshift && adduser -u 1001 -G fileshift -D fileshift
+
+WORKDIR /app
+
+# Copy package files first to leverage Docker's layer cache.
+# Reinstalling deps only happens when package.json changes, not on code edits.
+COPY backend/package*.json ./
+RUN npm ci --omit=dev && npm cache clean --force
+
+COPY --chown=fileshift:fileshift backend/src ./src
+
+# Storage dir mounted from a volume at runtime; permissions match runtime user.
+RUN mkdir -p /app/storage/uploads /app/storage/outputs /app/storage/work \
+    && chown -R fileshift:fileshift /app/storage
+
+# Drop privileges LAST — everything that needs root (package install,
+# user creation, chown) is done by this point.
+USER fileshift
+
+EXPOSE 4000
+
+ENTRYPOINT ["/sbin/tini", "--"]
+CMD ["node", "src/server.js"]

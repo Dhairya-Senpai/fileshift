@@ -1,0 +1,106 @@
+# FileShift — full stack orchestration.
+# Usage:
+#   docker compose up --build         # build images + start
+#   docker compose up -d              # background mode
+#   docker compose logs -f worker     # follow logs for one service
+#   docker compose down               # stop + remove containers
+#   docker compose down -v            # also wipe storage + redis volumes
+
+services:
+  # ─── Redis: BullMQ backend ───────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    # Healthcheck lets api/worker wait for redis to actually be ready,
+    # not just for the container to be running.
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    volumes:
+      - redis-data:/data
+    networks:
+      - fileshift
+
+  # ─── API: HTTP server (upload, status, download) ─────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      PORT: 4000
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      CORS_ORIGIN: ${CORS_ORIGIN:-http://localhost:8080}
+      MAX_FILE_SIZE: ${MAX_FILE_SIZE:-524288000}
+      RETENTION_HOURS: ${RETENTION_HOURS:-2}
+      JOB_TIMEOUT_MS: ${JOB_TIMEOUT_MS:-600000}
+      JOB_MAX_ATTEMPTS: ${JOB_MAX_ATTEMPTS:-2}
+      CLEANUP_INTERVAL_MINUTES: ${CLEANUP_INTERVAL_MINUTES:-15}
+      DOWNLOAD_TOKEN_SECRET: ${DOWNLOAD_TOKEN_SECRET:?ERROR — DOWNLOAD_TOKEN_SECRET must be set in .env}
+      DOWNLOAD_TOKEN_TTL: ${DOWNLOAD_TOKEN_TTL:-3600}
+    depends_on:
+      redis:
+        condition: service_healthy
+    volumes:
+      # Shared storage with worker — both must see the same uploads/outputs.
+      - fileshift-storage:/app/storage
+    networks:
+      - fileshift
+    # API isn't exposed to the host directly in production — nginx is the
+    # front door. For dev/debug you can uncomment to hit it directly.
+    # ports:
+    #   - "4000:4000"
+
+  # ─── Worker: BullMQ consumer running conversion adapters ─────────────────
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      JOB_TIMEOUT_MS: ${JOB_TIMEOUT_MS:-600000}
+      JOB_MAX_ATTEMPTS: ${JOB_MAX_ATTEMPTS:-2}
+      WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-2}
+      # Worker also signs nothing — but reads the secret only because the
+      # config module validates it. Re-using API's secret is correct here.
+      DOWNLOAD_TOKEN_SECRET: ${DOWNLOAD_TOKEN_SECRET:?ERROR — DOWNLOAD_TOKEN_SECRET must be set in .env}
+      # Tools are on PATH in the worker image — no override env vars needed.
+    depends_on:
+      redis:
+        condition: service_healthy
+    volumes:
+      - fileshift-storage:/app/storage
+    networks:
+      - fileshift
+    # Scale workers horizontally:
+    #   docker compose up --scale worker=4
+    # BullMQ handles distribution across instances automatically.
+
+  # ─── Frontend: nginx serving Vite build + /api proxy to API ──────────────
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+    restart: unless-stopped
+    depends_on:
+      - api
+    ports:
+      - "${FRONTEND_PORT:-8080}:80"
+    networks:
+      - fileshift
+
+# Named volumes survive `docker compose down` — wiped only by `down -v`.
+volumes:
+  redis-data:
+  fileshift-storage:
+
+networks:
+  fileshift:
+    driver: bridge

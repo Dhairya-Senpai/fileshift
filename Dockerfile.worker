@@ -1,0 +1,49 @@
+# Worker image — bigger than the API because it bundles every conversion tool.
+#
+# Why debian-slim instead of alpine?
+#   LibreOffice on Alpine is missing dictionaries/fonts and crashes on many
+#   real-world documents. Debian's LibreOffice is the stable, fully-featured
+#   build. Worth the ~200 MB size difference for reliability.
+FROM node:20-slim
+
+# Conversion tools + their runtime deps. Single RUN keeps layer count low.
+#   ffmpeg          → audio/video
+#   imagemagick     → images
+#   libreoffice-core + writer/calc/impress → documents, spreadsheets, presentations
+#   fonts-liberation, fonts-dejavu-core → so LO doesn't render with tofu boxes
+#   tini            → PID 1 signal handling
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        ffmpeg \
+        imagemagick \
+        libreoffice-core \
+        libreoffice-writer \
+        libreoffice-calc \
+        libreoffice-impress \
+        fonts-liberation \
+        fonts-dejavu-core \
+        tini \
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
+
+# ImageMagick on Debian ships with a strict policy.xml that blocks PDF/PS
+# handling for security reasons. We deliberately route PDFs through
+# LibreOffice (not ImageMagick), so the default policy is fine and we don't
+# relax it. If you ever need ImageMagick-PDF, that's where to edit.
+
+RUN groupadd -g 1001 fileshift && useradd -u 1001 -g fileshift -m -s /bin/bash fileshift
+
+WORKDIR /app
+
+COPY backend/package*.json ./
+RUN npm ci --omit=dev && npm cache clean --force
+
+COPY --chown=fileshift:fileshift backend/src ./src
+
+RUN mkdir -p /app/storage/uploads /app/storage/outputs /app/storage/work \
+    && chown -R fileshift:fileshift /app/storage
+
+USER fileshift
+
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["node", "src/worker.js"]

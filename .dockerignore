@@ -1,0 +1,19 @@
+# Keep docker build contexts small. Files listed here aren't even sent to
+# the docker daemon — speeds up builds and avoids accidentally baking secrets
+# or local state into images.
+
+**/node_modules
+**/dist
+**/.vite
+**/.env
+**/.env.local
+**/storage/uploads/*
+**/storage/outputs/*
+**/storage/work/*
+**/.git
+**/.gitignore
+**/.DS_Store
+**/*.log
+**/.vscode
+**/.idea
+**/README.md
